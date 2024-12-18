@@ -5909,12 +5909,14 @@ class SanaMultiscaleAttnProcessor2_0:
         batch_size, _, height, width = list(hidden_states.size())
         original_dtype = hidden_states.dtype
 
-        hidden_states = hidden_states.movedim(1, -1)
+        # hidden_states = hidden_states.movedim(1, -1)
+        hidden_states = hidden_states.permute(0, 2, 3, 1)
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
         value = attn.to_v(hidden_states)
         hidden_states = torch.cat([query, key, value], dim=3)
-        hidden_states = hidden_states.movedim(-1, 1)
+        # hidden_states = hidden_states.movedim(-1, 1)
+        hidden_states = hidden_states.permute(0, 3, 1, 2)
 
         multi_scale_qkv = [hidden_states]
         for block in attn.to_qkv_multiscale:
@@ -5939,10 +5941,12 @@ class SanaMultiscaleAttnProcessor2_0:
             hidden_states = attn.apply_quadratic_attention(query, key, value)
 
         hidden_states = torch.reshape(hidden_states, (batch_size, -1, height, width))
-        hidden_states = attn.to_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        # hidden_states = attn.to_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = attn.to_out(hidden_states.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         if attn.norm_type == "rms_norm":
-            hidden_states = attn.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+            # hidden_states = attn.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+            hidden_states = attn.norm_out(hidden_states.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         else:
             hidden_states = attn.norm_out(hidden_states)
 

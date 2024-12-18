@@ -74,7 +74,8 @@ class GLUMBConv(nn.Module):
 
         if self.norm_type == "rms_norm":
             # move channel to the last dimension so we apply RMSnorm across channel dimension
-            hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
+            # hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
+            hidden_states = self.norm(hidden_states.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         if self.residual_connection:
             hidden_states = hidden_states + residual

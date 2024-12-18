@@ -55,7 +55,8 @@ class ResBlock(nn.Module):
 
         if self.norm_type == "rms_norm":
             # move channel to the last dimension so we apply RMSnorm across channel dimension
-            hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
+            # hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
+            hidden_states = self.norm(hidden_states.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         else:
             hidden_states = self.norm(hidden_states)
 
@@ -371,7 +372,8 @@ class Decoder(nn.Module):
         for up_block in reversed(self.up_blocks):
             hidden_states = up_block(hidden_states)
 
-        hidden_states = self.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        # hidden_states = self.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = self.norm_out(hidden_states.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         hidden_states = self.conv_act(hidden_states)
         hidden_states = self.conv_out(hidden_states)
         return hidden_states
