@@ -413,13 +413,13 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         p = self.config.patch_size
         post_patch_height, post_patch_width = height // p, width // p
 
-        hidden_states = self.patch_embed(hidden_states.to(torch.float16))
+        hidden_states = self.patch_embed(hidden_states)
 
         timestep, embedded_timestep = self.time_embed(
             timestep, batch_size=batch_size, hidden_dtype=hidden_states.dtype
         )
 
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states.to(torch.float16))
+        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
 
         encoder_hidden_states = self.caption_norm(encoder_hidden_states)
