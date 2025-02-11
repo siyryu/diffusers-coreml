@@ -67,15 +67,12 @@ class LTXVideoCausalConv3d(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         time_kernel_size = self.kernel_size[0]
-
-        if self.is_causal:
-            pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, time_kernel_size - 1, 1, 1))
-            hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
-        else:
-            pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, (time_kernel_size - 1) // 2, 1, 1))
-            pad_right = hidden_states[:, :, -1:, :, :].repeat((1, 1, (time_kernel_size - 1) // 2, 1, 1))
-            hidden_states = torch.concatenate([pad_left, hidden_states, pad_right], dim=2)
-
+        if time_kernel_size > 1:
+            pad_count = time_kernel_size - 1
+            # 当 pad_count 为 0 时就不执行 repeat
+            pad_left = hidden_states[:, :, :1, :, :].repeat(1, 1, pad_count, 1, 1)
+            hidden_states = torch.cat([pad_left, hidden_states], dim=2)
+        # 如果 time_kernel_size 为 1，则直接使用原来的 hidden_states
         hidden_states = self.conv(hidden_states)
         return hidden_states
 
@@ -153,7 +150,8 @@ class LTXVideoResnetBlock3d(nn.Module):
     ) -> torch.Tensor:
         hidden_states = inputs
 
-        hidden_states = self.norm1(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        # hidden_states = self.norm1(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = self.norm1(hidden_states.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
 
         if self.scale_shift_table is not None:
             temb = temb.unflatten(1, (4, -1)) + self.scale_shift_table[None, ..., None, None, None]
@@ -170,7 +168,8 @@ class LTXVideoResnetBlock3d(nn.Module):
             )[None]
             hidden_states = hidden_states + (spatial_noise * self.per_channel_scale1)[None, :, None, ...]
 
-        hidden_states = self.norm2(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        # hidden_states = self.norm2(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = self.norm2(hidden_states.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
 
         if self.scale_shift_table is not None:
             hidden_states = hidden_states * (1 + scale_2) + shift_2
@@ -187,7 +186,8 @@ class LTXVideoResnetBlock3d(nn.Module):
             hidden_states = hidden_states + (spatial_noise * self.per_channel_scale2)[None, :, None, ...]
 
         if self.norm3 is not None:
-            inputs = self.norm3(inputs.movedim(1, -1)).movedim(-1, 1)
+            # inputs = self.norm3(inputs.movedim(1, -1)).movedim(-1, 1)
+            inputs = self.norm3(inputs.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
 
         if self.conv_shortcut is not None:
             inputs = self.conv_shortcut(inputs)
@@ -867,7 +867,8 @@ class LTXVideoEncoder3d(nn.Module):
 
             hidden_states = self.mid_block(hidden_states)
 
-        hidden_states = self.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        # hidden_states = self.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = self.norm_out(hidden_states.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
         hidden_states = self.conv_act(hidden_states)
         hidden_states = self.conv_out(hidden_states)
 
@@ -1006,7 +1007,8 @@ class LTXVideoDecoder3d(nn.Module):
             for up_block in self.up_blocks:
                 hidden_states = up_block(hidden_states, temb)
 
-        hidden_states = self.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        # hidden_states = self.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = self.norm_out(hidden_states.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
 
         if self.time_embedder is not None:
             temb = self.time_embedder(
