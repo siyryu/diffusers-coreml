@@ -20,9 +20,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..utils import is_torch_npu_available, is_torch_version
 from .activations import get_activation
 from .embeddings import CombinedTimestepLabelEmbeddings, PixArtAlphaCombinedTimestepSizeEmbeddings
+from ..utils import is_torch_version
 
 
 class AdaLayerNorm(nn.Module):
@@ -509,71 +509,33 @@ else:
 
 
 class RMSNorm(nn.Module):
-    r"""
-    RMS Norm as introduced in https://arxiv.org/abs/1910.07467 by Zhang et al.
-
-    Args:
-        dim (`int`): Number of dimensions to use for `weights`. Only effective when `elementwise_affine` is True.
-        eps (`float`): Small value to use when calculating the reciprocal of the square-root.
-        elementwise_affine (`bool`, defaults to `True`):
-            Boolean flag to denote if affine transformation should be applied.
-        bias (`bool`, defaults to False): If also training the `bias` param.
-    """
-
-    def __init__(self, dim, eps: float, elementwise_affine: bool = True, bias: bool = False):
+    def __init__(self, dim, eps: float, elementwise_affine: bool = True):
         super().__init__()
 
         self.eps = eps
-        self.elementwise_affine = elementwise_affine
 
         if isinstance(dim, numbers.Integral):
             dim = (dim,)
 
         self.dim = torch.Size(dim)
 
-        self.weight = None
-        self.bias = None
-
         if elementwise_affine:
             self.weight = nn.Parameter(torch.ones(dim))
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(dim))
+        else:
+            self.weight = None
 
     def forward(self, hidden_states):
-        if is_torch_npu_available():
-            import torch_npu
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
 
-            if self.weight is not None:
-                # convert into half-precision if necessary
-                if self.weight.dtype in [torch.float16, torch.bfloat16]:
-                    hidden_states = hidden_states.to(self.weight.dtype)
-            hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.eps)[0]
-            if self.bias is not None:
-                hidden_states = hidden_states + self.bias
-        elif is_torch_version(">=", "2.4"):
-            if self.weight is not None:
-                # convert into half-precision if necessary
-                if self.weight.dtype in [torch.float16, torch.bfloat16]:
-                    hidden_states = hidden_states.to(self.weight.dtype)
-            hidden_states = nn.functional.rms_norm(
-                hidden_states, normalized_shape=(hidden_states.shape[-1],), weight=self.weight, eps=self.eps
-            )
-            if self.bias is not None:
-                hidden_states = hidden_states + self.bias
+        if self.weight is not None:
+            # convert into half-precision if necessary
+            if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                hidden_states = hidden_states.to(self.weight.dtype)
+            hidden_states = hidden_states * self.weight
         else:
-            input_dtype = hidden_states.dtype
-            variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-            hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-
-            if self.weight is not None:
-                # convert into half-precision if necessary
-                if self.weight.dtype in [torch.float16, torch.bfloat16]:
-                    hidden_states = hidden_states.to(self.weight.dtype)
-                hidden_states = hidden_states * self.weight
-                if self.bias is not None:
-                    hidden_states = hidden_states + self.bias
-            else:
-                hidden_states = hidden_states.to(input_dtype)
+            hidden_states = hidden_states.to(input_dtype)
 
         return hidden_states
 
