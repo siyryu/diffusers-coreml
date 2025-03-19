@@ -17,20 +17,19 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ...configuration_utils import ConfigMixin, register_to_config
-from ...loaders import PeftAdapterMixin
-from ...utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers
 from ..attention_processor import (
     Attention,
     AttentionProcessor,
     AttnProcessor2_0,
-    SanaLinearAttnProcessor2_0,
+    SanaLinearAttnProcessorClamp,
 )
 from ..embeddings import PatchEmbed, PixArtAlphaTextProjection
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
 from ..normalization import AdaLayerNormSingle, RMSNorm
-
+from ...configuration_utils import ConfigMixin, register_to_config
+from ...loaders import PeftAdapterMixin
+from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -114,7 +113,8 @@ class SanaTransformerBlock(nn.Module):
             dropout=dropout,
             bias=attention_bias,
             cross_attention_dim=None,
-            processor=SanaLinearAttnProcessor2_0(),
+            # processor=SanaLinearAttnProcessor2_0(),
+            processor=SanaLinearAttnProcessorClamp()
         )
 
         # 2. Cross Attention

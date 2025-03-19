@@ -24,7 +24,6 @@ from ..utils import deprecate, is_torch_xla_available, logging
 from ..utils.import_utils import is_torch_npu_available, is_torch_xla_version, is_xformers_available
 from ..utils.torch_utils import is_torch_version, maybe_allow_in_graph
 
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 if is_torch_npu_available():
@@ -6046,6 +6045,52 @@ class SanaLinearAttnProcessor2_0:
 
         if original_dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
+
+        return hidden_states
+
+
+class SanaLinearAttnProcessorClamp:
+    r"""
+    Processor for implementing scaled dot-product linear attention.
+    Use clamp instaed of float32 transform
+    """
+
+    def __call__(
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        original_dtype = hidden_states.dtype
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = query.transpose(1, 2).unflatten(1, (attn.heads, -1))
+        key = key.transpose(1, 2).unflatten(1, (attn.heads, -1)).transpose(2, 3)
+        value = value.transpose(1, 2).unflatten(1, (attn.heads, -1))
+
+        query = F.relu(query)
+        key = F.relu(key)
+
+        # query, key, value = query.float(), key.float(), value.float()
+
+        value = F.pad(value, (0, 0, 0, 1), mode="constant", value=1.0)
+        scores = torch.matmul(value, key)
+        hidden_states = torch.matmul(scores, query)
+
+        hidden_states = torch.clamp(hidden_states, min=-65504, max=65504)
+
+        hidden_states = hidden_states[:, :, :-1] / (hidden_states[:, :, -1:] + 1e-7)
+        hidden_states = hidden_states.flatten(1, 2).transpose(1, 2)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
 
         return hidden_states
 
