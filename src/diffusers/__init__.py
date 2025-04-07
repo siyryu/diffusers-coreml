@@ -23,7 +23,6 @@ from .utils import (
     is_transformers_available,
 )
 
-
 # Lazy Import based on
 # https://github.com/huggingface/transformers/blob/main/src/transformers/__init__.py
 
@@ -187,6 +186,7 @@ else:
             "PriorTransformer",
             "SanaTransformer2DModel",
             "SanaTransformer3DModel",
+            "LTXSanaTransformer3DModel",
             "SD3ControlNetModel",
             "SD3MultiControlNetModel",
             "SD3Transformer2DModel",
@@ -424,6 +424,7 @@ else:
             "ReduxImageEncoder",
             "SanaPAGPipeline",
             "SanaPipeline",
+            "LTXSana3dPipeline",
             "SemanticStableDiffusionPipeline",
             "ShapEImg2ImgPipeline",
             "ShapEPipeline",
@@ -755,6 +756,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             PriorTransformer,
             SanaTransformer2DModel,
             SanaTransformer3DModel,
+            LTXSanaTransformer3DModel,
             SD3ControlNetModel,
             SD3MultiControlNetModel,
             SD3Transformer2DModel,
@@ -971,6 +973,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             ReduxImageEncoder,
             SanaPAGPipeline,
             SanaPipeline,
+            LTXSana3dPipeline,
             SemanticStableDiffusionPipeline,
             ShapEImg2ImgPipeline,
             ShapEPipeline,

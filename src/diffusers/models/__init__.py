@@ -21,7 +21,6 @@ from ..utils import (
     is_torch_available,
 )
 
-
 _import_structure = {}
 
 if is_torch_available():
@@ -68,6 +67,7 @@ if is_torch_available():
     _import_structure["transformers.prior_transformer"] = ["PriorTransformer"]
     _import_structure["transformers.sana_transformer"] = ["SanaTransformer2DModel"]
     _import_structure["transformers.sana_transformer_3d"] = ["SanaTransformer3DModel"]
+    _import_structure["transformers.sana_transformer_3dvae"] = ["LTXSanaTransformer3DModel"]
     _import_structure["transformers.stable_audio_transformer"] = ["StableAudioDiTModel"]
     _import_structure["transformers.t5_film_transformer"] = ["T5FilmDecoder"]
     _import_structure["transformers.transformer_2d"] = ["Transformer2DModel"]
@@ -162,6 +162,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             PriorTransformer,
             SanaTransformer2DModel,
             SanaTransformer3DModel,
+            LTXSanaTransformer3DModel,
             SD3Transformer2DModel,
             StableAudioDiTModel,
             T5FilmDecoder,
