@@ -18,15 +18,15 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from ...configuration_utils import ConfigMixin, register_to_config
-from ...loaders import FromOriginalModelMixin
-from ...utils.accelerate_utils import apply_forward_hook
+from .vae import DecoderOutput, DiagonalGaussianDistribution
 from ..activations import get_activation
 from ..embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings
 from ..modeling_outputs import AutoencoderKLOutput
 from ..modeling_utils import ModelMixin
 from ..normalization import RMSNorm
-from .vae import DecoderOutput, DiagonalGaussianDistribution
+from ...configuration_utils import ConfigMixin, register_to_config
+from ...loaders import FromOriginalModelMixin
+from ...utils.accelerate_utils import apply_forward_hook
 
 
 class LTXVideoCausalConv3d(nn.Module):
@@ -275,26 +275,29 @@ class LTXVideoUpsampler3d(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
-        if self.residual:
-            residual = hidden_states.reshape(
-                batch_size, -1, self.stride[0], self.stride[1], self.stride[2], num_frames, height, width
-            )
-            residual = residual.permute(0, 1, 5, 2, 6, 3, 7, 4).flatten(6, 7).flatten(4, 5).flatten(2, 3)
-            repeats = (self.stride[0] * self.stride[1] * self.stride[2]) // self.upscale_factor
-            residual = residual.repeat(1, repeats, 1, 1, 1)
-            residual = residual[:, :, self.stride[0] - 1 :]
-
         hidden_states = self.conv(hidden_states)
-        hidden_states = hidden_states.reshape(
-            batch_size, -1, self.stride[0], self.stride[1], self.stride[2], num_frames, height, width
-        )
-        hidden_states = hidden_states.permute(0, 1, 5, 2, 6, 3, 7, 4).flatten(6, 7).flatten(4, 5).flatten(2, 3)
-        hidden_states = hidden_states[:, :, self.stride[0] - 1 :]
 
-        if self.residual:
-            hidden_states = hidden_states + residual
+        # 步骤1：时间维度上采样
+        hidden_states = hidden_states.reshape(batch_size, -1, self.stride[0], num_frames, height, width)
+        hidden_states = hidden_states.permute(0, 1, 3, 2, 4, 5)
+        hidden_states = hidden_states.reshape(batch_size, -1, num_frames * self.stride[0], height, width)
+
+        # 步骤2：空间维度上采样（使用2D pixel shuffle）
+        upsampled_frames = num_frames * self.stride[0]
+        hidden_states = hidden_states.permute(0, 2, 1, 3, 4)
+        hidden_states = hidden_states.reshape(batch_size * upsampled_frames, -1, height, width)
+        hidden_states = torch.nn.functional.pixel_shuffle(hidden_states, self.stride[1])  # 假设stride[1] == stride[2]
+
+        # 步骤3：重新组织形状
+        _, c, h, w = hidden_states.shape
+        hidden_states = hidden_states.reshape(batch_size, upsampled_frames, c, h, w)
+        hidden_states = hidden_states.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+
+        # 步骤4：截取所需的时间帧
+        hidden_states = hidden_states[:, :, self.stride[0] - 1:]
 
         return hidden_states
+
 
 
 class LTXVideoDownBlock3D(nn.Module):
@@ -683,7 +686,7 @@ class LTXVideoUpBlock3d(nn.Module):
                     out_channels=out_channels,
                     dropout=dropout,
                     eps=resnet_eps,
-                    non_linearity=resnet_act_fn,
+                    non_linearity="relu",
                     is_causal=is_causal,
                     inject_noise=inject_noise,
                     timestep_conditioning=timestep_conditioning,
@@ -1030,8 +1033,9 @@ class LTXVideoDecoder3d(nn.Module):
         p_t = self.patch_size_t
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
-        hidden_states = hidden_states.reshape(batch_size, -1, p_t, p, p, num_frames, height, width)
-        hidden_states = hidden_states.permute(0, 1, 5, 2, 6, 4, 7, 3).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        hidden_states = hidden_states.reshape(1, -1, 4, 4, 17, 184, 320)
+        hidden_states = hidden_states.permute(0, 1, 4, 3, 2, 5, 6).flatten(3, 4).reshape(51, 16, 184, 320)
+        hidden_states = torch.pixel_shuffle(hidden_states, 4).reshape(1, 3, 17, 736, 1280)
 
         return hidden_states
 
