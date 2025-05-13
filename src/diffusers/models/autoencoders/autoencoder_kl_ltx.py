@@ -1033,9 +1033,10 @@ class LTXVideoDecoder3d(nn.Module):
         p_t = self.patch_size_t
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
-        hidden_states = hidden_states.reshape(1, -1, 4, 4, 17, 184, 320)
-        hidden_states = hidden_states.permute(0, 1, 4, 3, 2, 5, 6).flatten(3, 4).reshape(51, 16, 184, 320)
-        hidden_states = torch.pixel_shuffle(hidden_states, 4).reshape(1, 3, 17, 736, 1280)
+        hidden_states = hidden_states.reshape(1, -1, 4, 4, num_frames, height, width)
+        hidden_states = hidden_states.permute(0, 1, 4, 3, 2, 5, 6).flatten(3, 4).reshape(3 * num_frames, 16, height,
+                                                                                         width)
+        hidden_states = torch.pixel_shuffle(hidden_states, 4).reshape(1, 3, 17, 4 * height, 4 * width)
 
         return hidden_states
 
