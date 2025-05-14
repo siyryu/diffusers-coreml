@@ -6096,7 +6096,7 @@ class SanaLinearAttnProcessor2_0:
             rope=False
     ) -> torch.Tensor:
         if rope:
-            self.rope = RoPE3D()
+            self.rope = RoPE3D(interpolation_scale_thw=(1, 1.4375, 2.5))
             self.position_getter = PositionGetter3D()
 
         original_dtype = hidden_states.dtype
@@ -6114,7 +6114,7 @@ class SanaLinearAttnProcessor2_0:
 
         if rope:
             query = query.transpose(-1, -2)
-            pos_thw = self.position_getter(hidden_states.shape[0], t=3, h=16, w=16, device=query.device)
+            pos_thw = self.position_getter(hidden_states.shape[0], t=3, h=23, w=40, device=query.device)  # for 720p
             query = self.rope(query, pos_thw)
             key = self.rope(key, pos_thw)
             query = query.transpose(-1, -2)

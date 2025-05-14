@@ -518,8 +518,8 @@ class LTXSanaTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         hidden_states = self.patch_embed(hidden_states)
         hidden_states = hidden_states.view(batch_size, T, S, -1).reshape(batch_size, T * S, -1)
 
-        # fro i2v
-        timestep = timestep.unsqueeze(1).repeat(1, 768)  # for 512
+        # for i2v
+        timestep = timestep.unsqueeze(1).repeat(1, hidden_states.shape[1])  # for 512
         timestep = torch.min(timestep, (1.0 - cond_mask) * 1000.0)
 
         timestep, embedded_timestep = self.time_embed(
