@@ -91,7 +91,11 @@ class SanaModulatedNorm(nn.Module):
             self, hidden_states: torch.Tensor, temb: torch.Tensor, scale_shift_table: torch.Tensor
     ) -> torch.Tensor:
         hidden_states = self.norm(hidden_states)
-        shift, scale = (scale_shift_table[None] + temb[:, None].to(scale_shift_table.device)).chunk(2, dim=1)
+        # shift, scale = (scale_shift_table[None] + temb[:, None].to(scale_shift_table.device)).chunk(2, dim=1)
+        # for i2v
+        shift, scale = (scale_shift_table[None] + temb[:, :, None].to(scale_shift_table.device)).chunk(2, dim=2)
+        shift = shift.squeeze(2)
+        scale = scale.squeeze(2)
         hidden_states = hidden_states * (1 + scale) + shift
         return hidden_states
 
@@ -164,16 +168,27 @@ class LTX3DSanaTransformerBlock(nn.Module):
         batch_size = hidden_states.shape[0]
 
         # 1. Modulation
+        # shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+        #         self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+        # ).chunk(6, dim=1)
+        N = hidden_states.shape[1]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
-        ).chunk(6, dim=1)
+                self.scale_shift_table[None] + timestep.reshape(batch_size, N, 6, -1)
+        ).chunk(6, dim=2)
+        shift_msa = shift_msa.squeeze(2)
+        scale_msa = scale_msa.squeeze(2)
+        gate_msa = gate_msa.squeeze(2)
+        shift_mlp = shift_mlp.squeeze(2)
+        scale_mlp = scale_mlp.squeeze(2)
+        gate_mlp = gate_mlp.squeeze(2)
 
         # 2. Self Attention
         norm_hidden_states = self.norm1(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
         norm_hidden_states = norm_hidden_states.to(hidden_states.dtype)
 
-        attn_output = self.attn1(norm_hidden_states)
+        attn_output = self.attn1(norm_hidden_states,
+                                 rope=True)
         hidden_states = hidden_states + gate_msa * attn_output
 
         # 3. Cross Attention
@@ -446,6 +461,7 @@ class LTXSanaTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             hidden_states: torch.Tensor,
             encoder_hidden_states: torch.Tensor,
             timestep: torch.LongTensor,
+            cond_mask: torch.Tensor,
             encoder_attention_mask: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -501,6 +517,10 @@ class LTXSanaTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         hidden_states = hidden_states.permute(0, 2, 1, 3, 4).reshape(batch_size * T, -1, H, W)
         hidden_states = self.patch_embed(hidden_states)
         hidden_states = hidden_states.view(batch_size, T, S, -1).reshape(batch_size, T * S, -1)
+
+        # fro i2v
+        timestep = timestep.unsqueeze(1).repeat(1, 768)  # for 512
+        timestep = torch.min(timestep, (1.0 - cond_mask) * 1000.0)
 
         timestep, embedded_timestep = self.time_embed(
             timestep, batch_size=batch_size, hidden_dtype=hidden_states.dtype

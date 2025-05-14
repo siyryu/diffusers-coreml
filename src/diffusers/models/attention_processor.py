@@ -45,6 +45,87 @@ else:
     XLA_AVAILABLE = False
 
 
+class PositionGetter3D(object):
+    """ return positions of patches """
+
+    def __init__(self, ):
+        self.cache_positions = {}
+
+    def __call__(self, b, t, h, w, device):
+        if not (b, t, h, w) in self.cache_positions:
+            x = torch.arange(w, device=device)
+            y = torch.arange(h, device=device)
+            z = torch.arange(t, device=device)
+            pos = torch.cartesian_prod(z, y, x)
+
+            pos = pos.reshape(t * h * w, 3).transpose(0, 1).reshape(3, 1, -1).contiguous().expand(3, b, -1).clone()
+            poses = (pos[0].contiguous(), pos[1].contiguous(), pos[2].contiguous())
+            max_poses = (int(poses[0].max()), int(poses[1].max()), int(poses[2].max()))
+
+            self.cache_positions[b, t, h, w] = (poses, max_poses)
+        pos = self.cache_positions[b, t, h, w]
+
+        return pos
+
+
+class RoPE3D(torch.nn.Module):
+    def __init__(self, freq=10000.0, F0=1.0, interpolation_scale_thw=(1, 1, 1)):
+        super().__init__()
+        self.base = freq
+        self.F0 = F0
+        self.interpolation_scale_t = interpolation_scale_thw[0]
+        self.interpolation_scale_h = interpolation_scale_thw[1]
+        self.interpolation_scale_w = interpolation_scale_thw[2]
+        self.cache = {}
+
+    def get_cos_sin(self, D, seq_len, device, dtype, interpolation_scale=1):
+        if (D, seq_len, device, dtype) not in self.cache:
+            inv_freq = 1.0 / (self.base ** (torch.arange(0, D, 2).float().to(device) / D))
+            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype) / interpolation_scale
+            freqs = torch.einsum("i,j->ij", t, inv_freq).to(dtype)
+            freqs = torch.cat((freqs, freqs), dim=-1)
+            cos = freqs.cos()  # (Seq, Dim)
+            sin = freqs.sin()
+            self.cache[D, seq_len, device, dtype] = (cos, sin)
+        return self.cache[D, seq_len, device, dtype]
+
+    @staticmethod
+    def rotate_half(x):
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rope1d(self, tokens, pos1d, cos, sin):
+        assert pos1d.ndim == 2
+
+        # for (batch_size x ntokens x nheads x dim)
+        cos = torch.nn.functional.embedding(pos1d, cos)[:, None, :, :]
+        sin = torch.nn.functional.embedding(pos1d, sin)[:, None, :, :]
+        return (tokens * cos) + (self.rotate_half(tokens) * sin)
+
+    def forward(self, tokens, positions):
+        """
+        input:
+            * tokens: batch_size x nheads x ntokens x dim
+            * positions: batch_size x ntokens x 3 (t, y and x position of each token)
+        output:
+            * tokens after appplying RoPE3D (batch_size x nheads x ntokens x x dim)
+        """
+        assert tokens.size(3) % 3 == 0, "number of dimensions should be a multiple of three"
+        D = tokens.size(3) // 3
+        poses, max_poses = positions
+        assert len(poses) == 3 and poses[0].ndim == 2  # Batch, Seq, 3
+        cos_t, sin_t = self.get_cos_sin(D, max_poses[0] + 1, tokens.device, tokens.dtype, self.interpolation_scale_t)
+        cos_y, sin_y = self.get_cos_sin(D, max_poses[1] + 1, tokens.device, tokens.dtype, self.interpolation_scale_h)
+        cos_x, sin_x = self.get_cos_sin(D, max_poses[2] + 1, tokens.device, tokens.dtype, self.interpolation_scale_w)
+        # split features into three along the feature dimension, and apply rope1d on each half
+        t, y, x = tokens.chunk(3, dim=-1)
+        t = self.apply_rope1d(t, poses[0], cos_t, sin_t)
+        y = self.apply_rope1d(y, poses[1], cos_y, sin_y)
+        x = self.apply_rope1d(x, poses[2], cos_x, sin_x)
+        tokens = torch.cat((t, y, x), dim=-1)
+        return tokens
+
+
 @maybe_allow_in_graph
 class Attention(nn.Module):
     r"""
@@ -102,37 +183,37 @@ class Attention(nn.Module):
     """
 
     def __init__(
-        self,
-        query_dim: int,
-        cross_attention_dim: Optional[int] = None,
-        heads: int = 8,
-        kv_heads: Optional[int] = None,
-        dim_head: int = 64,
-        dropout: float = 0.0,
-        bias: bool = False,
-        upcast_attention: bool = False,
-        upcast_softmax: bool = False,
-        cross_attention_norm: Optional[str] = None,
-        cross_attention_norm_num_groups: int = 32,
-        qk_norm: Optional[str] = None,
-        added_kv_proj_dim: Optional[int] = None,
-        added_proj_bias: Optional[bool] = True,
-        norm_num_groups: Optional[int] = None,
-        spatial_norm_dim: Optional[int] = None,
-        out_bias: bool = True,
-        scale_qk: bool = True,
-        only_cross_attention: bool = False,
-        eps: float = 1e-5,
-        rescale_output_factor: float = 1.0,
-        residual_connection: bool = False,
-        _from_deprecated_attn_block: bool = False,
-        processor: Optional["AttnProcessor"] = None,
-        out_dim: int = None,
-        out_context_dim: int = None,
-        context_pre_only=None,
-        pre_only=False,
-        elementwise_affine: bool = True,
-        is_causal: bool = False,
+            self,
+            query_dim: int,
+            cross_attention_dim: Optional[int] = None,
+            heads: int = 8,
+            kv_heads: Optional[int] = None,
+            dim_head: int = 64,
+            dropout: float = 0.0,
+            bias: bool = False,
+            upcast_attention: bool = False,
+            upcast_softmax: bool = False,
+            cross_attention_norm: Optional[str] = None,
+            cross_attention_norm_num_groups: int = 32,
+            qk_norm: Optional[str] = None,
+            added_kv_proj_dim: Optional[int] = None,
+            added_proj_bias: Optional[bool] = True,
+            norm_num_groups: Optional[int] = None,
+            spatial_norm_dim: Optional[int] = None,
+            out_bias: bool = True,
+            scale_qk: bool = True,
+            only_cross_attention: bool = False,
+            eps: float = 1e-5,
+            rescale_output_factor: float = 1.0,
+            residual_connection: bool = False,
+            _from_deprecated_attn_block: bool = False,
+            processor: Optional["AttnProcessor"] = None,
+            out_dim: int = None,
+            out_context_dim: int = None,
+            context_pre_only=None,
+            pre_only=False,
+            elementwise_affine: bool = True,
+            is_causal: bool = False,
     ):
         super().__init__()
 
@@ -162,7 +243,7 @@ class Attention(nn.Module):
         self._from_deprecated_attn_block = _from_deprecated_attn_block
 
         self.scale_qk = scale_qk
-        self.scale = dim_head**-0.5 if self.scale_qk else 1.0
+        self.scale = dim_head ** -0.5 if self.scale_qk else 1.0
 
         self.heads = out_dim // dim_head if out_dim is not None else heads
         # for slice_size > 0 the attention score computation
@@ -306,10 +387,10 @@ class Attention(nn.Module):
         self.set_processor(processor)
 
     def set_use_xla_flash_attention(
-        self,
-        use_xla_flash_attention: bool,
-        partition_spec: Optional[Tuple[Optional[str], ...]] = None,
-        is_flux=False,
+            self,
+            use_xla_flash_attention: bool,
+            partition_spec: Optional[Tuple[Optional[str], ...]] = None,
+            is_flux=False,
     ) -> None:
         r"""
         Set whether to use xla flash attention from `torch_xla` or not.
@@ -356,7 +437,7 @@ class Attention(nn.Module):
         self.set_processor(processor)
 
     def set_use_memory_efficient_attention_xformers(
-        self, use_memory_efficient_attention_xformers: bool, attention_op: Optional[Callable] = None
+            self, use_memory_efficient_attention_xformers: bool, attention_op: Optional[Callable] = None
     ) -> None:
         r"""
         Set whether to use memory efficient attention from `xformers` or not.
@@ -540,9 +621,9 @@ class Attention(nn.Module):
         # if current processor is in `self._modules` and if passed `processor` is not, we need to
         # pop `processor` from `self._modules`
         if (
-            hasattr(self, "processor")
-            and isinstance(self.processor, torch.nn.Module)
-            and not isinstance(processor, torch.nn.Module)
+                hasattr(self, "processor")
+                and isinstance(self.processor, torch.nn.Module)
+                and not isinstance(processor, torch.nn.Module)
         ):
             logger.info(f"You are removing possibly trained weights of {self.processor} with {processor}")
             self._modules.pop("processor")
@@ -564,11 +645,11 @@ class Attention(nn.Module):
             return self.processor
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        **cross_attention_kwargs,
+            self,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            **cross_attention_kwargs,
     ) -> torch.Tensor:
         r"""
         The forward method of the `Attention` class.
@@ -654,7 +735,7 @@ class Attention(nn.Module):
         return tensor
 
     def get_attention_scores(
-        self, query: torch.Tensor, key: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+            self, query: torch.Tensor, key: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         r"""
         Compute the attention scores.
@@ -701,7 +782,7 @@ class Attention(nn.Module):
         return attention_probs
 
     def prepare_attention_mask(
-        self, attention_mask: torch.Tensor, target_length: int, batch_size: int, out_dim: int = 3
+            self, attention_mask: torch.Tensor, target_length: int, batch_size: int, out_dim: int = 3
     ) -> torch.Tensor:
         r"""
         Prepare the attention mask for the attention computation.
@@ -811,9 +892,9 @@ class Attention(nn.Module):
 
         # handle added projections for SD3 and others.
         if (
-            getattr(self, "add_q_proj", None) is not None
-            and getattr(self, "add_k_proj", None) is not None
-            and getattr(self, "add_v_proj", None) is not None
+                getattr(self, "add_q_proj", None) is not None
+                and getattr(self, "add_k_proj", None) is not None
+                and getattr(self, "add_v_proj", None) is not None
         ):
             concatenated_weights = torch.cat(
                 [self.add_q_proj.weight.data, self.add_k_proj.weight.data, self.add_v_proj.weight.data]
@@ -836,10 +917,10 @@ class Attention(nn.Module):
 
 class SanaMultiscaleAttentionProjection(nn.Module):
     def __init__(
-        self,
-        in_channels: int,
-        num_attention_heads: int,
-        kernel_size: int,
+            self,
+            in_channels: int,
+            num_attention_heads: int,
+            kernel_size: int,
     ) -> None:
         super().__init__()
 
@@ -864,16 +945,16 @@ class SanaMultiscaleLinearAttention(nn.Module):
     r"""Lightweight multi-scale linear attention"""
 
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        num_attention_heads: Optional[int] = None,
-        attention_head_dim: int = 8,
-        mult: float = 1.0,
-        norm_type: str = "batch_norm",
-        kernel_sizes: Tuple[int, ...] = (5,),
-        eps: float = 1e-15,
-        residual_connection: bool = False,
+            self,
+            in_channels: int,
+            out_channels: int,
+            num_attention_heads: Optional[int] = None,
+            attention_head_dim: int = 8,
+            mult: float = 1.0,
+            norm_type: str = "batch_norm",
+            kernel_sizes: Tuple[int, ...] = (5,),
+            eps: float = 1e-15,
+            residual_connection: bool = False,
     ):
         super().__init__()
 
@@ -928,20 +1009,20 @@ class SanaMultiscaleLinearAttention(nn.Module):
 
 class MochiAttention(nn.Module):
     def __init__(
-        self,
-        query_dim: int,
-        added_kv_proj_dim: int,
-        processor: "MochiAttnProcessor2_0",
-        heads: int = 8,
-        dim_head: int = 64,
-        dropout: float = 0.0,
-        bias: bool = False,
-        added_proj_bias: bool = True,
-        out_dim: Optional[int] = None,
-        out_context_dim: Optional[int] = None,
-        out_bias: bool = True,
-        context_pre_only: bool = False,
-        eps: float = 1e-5,
+            self,
+            query_dim: int,
+            added_kv_proj_dim: int,
+            processor: "MochiAttnProcessor2_0",
+            heads: int = 8,
+            dim_head: int = 64,
+            dropout: float = 0.0,
+            bias: bool = False,
+            added_proj_bias: bool = True,
+            out_dim: Optional[int] = None,
+            out_context_dim: Optional[int] = None,
+            out_bias: bool = True,
+            context_pre_only: bool = False,
+            eps: float = 1e-5,
     ):
         super().__init__()
         from .normalization import MochiRMSNorm
@@ -977,11 +1058,11 @@ class MochiAttention(nn.Module):
         self.processor = processor
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
+            self,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            **kwargs,
     ):
         return self.processor(
             self,
@@ -1000,12 +1081,12 @@ class MochiAttnProcessor2_0:
             raise ImportError("MochiAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: "MochiAttention",
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: "MochiAttention",
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
@@ -1034,7 +1115,6 @@ class MochiAttnProcessor2_0:
             encoder_key = attn.norm_added_k(encoder_key)
 
         if image_rotary_emb is not None:
-
             def apply_rotary_emb(x, freqs_cos, freqs_sin):
                 x_even = x[..., 0::2].float()
                 x_odd = x[..., 1::2].float()
@@ -1064,13 +1144,13 @@ class MochiAttnProcessor2_0:
             mask = attention_mask[idx][None, :]
             valid_prompt_token_indices = torch.nonzero(mask.flatten(), as_tuple=False).flatten()
 
-            valid_encoder_query = encoder_query[idx : idx + 1, :, valid_prompt_token_indices, :]
-            valid_encoder_key = encoder_key[idx : idx + 1, :, valid_prompt_token_indices, :]
-            valid_encoder_value = encoder_value[idx : idx + 1, :, valid_prompt_token_indices, :]
+            valid_encoder_query = encoder_query[idx: idx + 1, :, valid_prompt_token_indices, :]
+            valid_encoder_key = encoder_key[idx: idx + 1, :, valid_prompt_token_indices, :]
+            valid_encoder_value = encoder_value[idx: idx + 1, :, valid_prompt_token_indices, :]
 
-            valid_query = torch.cat([query[idx : idx + 1], valid_encoder_query], dim=2)
-            valid_key = torch.cat([key[idx : idx + 1], valid_encoder_key], dim=2)
-            valid_value = torch.cat([value[idx : idx + 1], valid_encoder_value], dim=2)
+            valid_query = torch.cat([query[idx: idx + 1], valid_encoder_query], dim=2)
+            valid_key = torch.cat([key[idx: idx + 1], valid_encoder_key], dim=2)
+            valid_value = torch.cat([value[idx: idx + 1], valid_encoder_value], dim=2)
 
             attn_output = F.scaled_dot_product_attention(
                 valid_query, valid_key, valid_value, dropout_p=0.0, is_causal=False
@@ -1103,14 +1183,14 @@ class AttnProcessor:
     """
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
@@ -1189,13 +1269,13 @@ class CustomDiffusionAttnProcessor(nn.Module):
     """
 
     def __init__(
-        self,
-        train_kv: bool = True,
-        train_q_out: bool = True,
-        hidden_size: Optional[int] = None,
-        cross_attention_dim: Optional[int] = None,
-        out_bias: bool = True,
-        dropout: float = 0.0,
+            self,
+            train_kv: bool = True,
+            train_q_out: bool = True,
+            hidden_size: Optional[int] = None,
+            cross_attention_dim: Optional[int] = None,
+            out_bias: bool = True,
+            dropout: float = 0.0,
     ):
         super().__init__()
         self.train_kv = train_kv
@@ -1215,11 +1295,11 @@ class CustomDiffusionAttnProcessor(nn.Module):
             self.to_out_custom_diffusion.append(nn.Dropout(dropout))
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
@@ -1280,13 +1360,13 @@ class AttnAddedKVProcessor:
     """
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
@@ -1353,13 +1433,13 @@ class AttnAddedKVProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
@@ -1424,13 +1504,13 @@ class JointAttnProcessor2_0:
             raise ImportError("JointAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.FloatTensor:
         residual = hidden_states
 
@@ -1486,7 +1566,7 @@ class JointAttnProcessor2_0:
             # Split the attention outputs.
             hidden_states, encoder_hidden_states = (
                 hidden_states[:, : residual.shape[1]],
-                hidden_states[:, residual.shape[1] :],
+                hidden_states[:, residual.shape[1]:],
             )
             if not attn.context_pre_only:
                 encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
@@ -1512,11 +1592,11 @@ class PAGJointAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
     ) -> torch.FloatTensor:
         residual = hidden_states
 
@@ -1570,7 +1650,7 @@ class PAGJointAttnProcessor2_0:
         # Split the attention outputs.
         hidden_states_org, encoder_hidden_states_org = (
             hidden_states_org[:, : residual.shape[1]],
-            hidden_states_org[:, residual.shape[1] :],
+            hidden_states_org[:, residual.shape[1]:],
         )
 
         # linear proj
@@ -1634,7 +1714,7 @@ class PAGJointAttnProcessor2_0:
         # split the attention outputs.
         hidden_states_ptb, encoder_hidden_states_ptb = (
             hidden_states_ptb[:, : residual.shape[1]],
-            hidden_states_ptb[:, residual.shape[1] :],
+            hidden_states_ptb[:, residual.shape[1]:],
         )
 
         # linear proj
@@ -1668,13 +1748,13 @@ class PAGCFGJointAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.FloatTensor:
         residual = hidden_states
 
@@ -1735,7 +1815,7 @@ class PAGCFGJointAttnProcessor2_0:
         # Split the attention outputs.
         hidden_states_org, encoder_hidden_states_org = (
             hidden_states_org[:, : residual.shape[1]],
-            hidden_states_org[:, residual.shape[1] :],
+            hidden_states_org[:, residual.shape[1]:],
         )
 
         # linear proj
@@ -1799,7 +1879,7 @@ class PAGCFGJointAttnProcessor2_0:
         # split the attention outputs.
         hidden_states_ptb, encoder_hidden_states_ptb = (
             hidden_states_ptb[:, : residual.shape[1]],
-            hidden_states_ptb[:, residual.shape[1] :],
+            hidden_states_ptb[:, residual.shape[1]:],
         )
 
         # linear proj
@@ -1831,13 +1911,13 @@ class FusedJointAttnProcessor2_0:
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.FloatTensor:
         residual = hidden_states
 
@@ -1884,7 +1964,7 @@ class FusedJointAttnProcessor2_0:
         # Split the attention outputs.
         hidden_states, encoder_hidden_states = (
             hidden_states[:, : residual.shape[1]],
-            hidden_states[:, residual.shape[1] :],
+            hidden_states[:, residual.shape[1]:],
         )
 
         # linear proj
@@ -1918,13 +1998,13 @@ class XFormersJointAttnProcessor:
         self.attention_op = attention_op
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.FloatTensor:
         residual = hidden_states
 
@@ -1971,7 +2051,7 @@ class XFormersJointAttnProcessor:
             # Split the attention outputs.
             hidden_states, encoder_hidden_states = (
                 hidden_states[:, : residual.shape[1]],
-                hidden_states[:, residual.shape[1] :],
+                hidden_states[:, residual.shape[1]:],
             )
             if not attn.context_pre_only:
                 encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
@@ -2000,13 +2080,13 @@ class AllegroAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -2091,12 +2171,12 @@ class AuraFlowAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            *args,
+            **kwargs,
     ) -> torch.FloatTensor:
         batch_size = hidden_states.shape[0]
 
@@ -2157,7 +2237,7 @@ class AuraFlowAttnProcessor2_0:
         # Split the attention outputs.
         if encoder_hidden_states is not None:
             hidden_states, encoder_hidden_states = (
-                hidden_states[:, encoder_hidden_states.shape[1] :],
+                hidden_states[:, encoder_hidden_states.shape[1]:],
                 hidden_states[:, : encoder_hidden_states.shape[1]],
             )
 
@@ -2184,12 +2264,12 @@ class FusedAuraFlowAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            *args,
+            **kwargs,
     ) -> torch.FloatTensor:
         batch_size = hidden_states.shape[0]
 
@@ -2254,7 +2334,7 @@ class FusedAuraFlowAttnProcessor2_0:
         # Split the attention outputs.
         if encoder_hidden_states is not None:
             hidden_states, encoder_hidden_states = (
-                hidden_states[:, encoder_hidden_states.shape[1] :],
+                hidden_states[:, encoder_hidden_states.shape[1]:],
                 hidden_states[:, : encoder_hidden_states.shape[1]],
             )
 
@@ -2279,12 +2359,12 @@ class FluxAttnProcessor2_0:
             raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -2348,7 +2428,7 @@ class FluxAttnProcessor2_0:
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1] :],
+                hidden_states[:, encoder_hidden_states.shape[1]:],
             )
 
             # linear proj
@@ -2373,12 +2453,12 @@ class FluxAttnProcessor2_0_NPU:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -2455,7 +2535,7 @@ class FluxAttnProcessor2_0_NPU:
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1] :],
+                hidden_states[:, encoder_hidden_states.shape[1]:],
             )
 
             # linear proj
@@ -2479,12 +2559,12 @@ class FusedFluxAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -2550,7 +2630,7 @@ class FusedFluxAttnProcessor2_0:
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1] :],
+                hidden_states[:, encoder_hidden_states.shape[1]:],
             )
 
             # linear proj
@@ -2574,12 +2654,12 @@ class FusedFluxAttnProcessor2_0_NPU:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -2661,7 +2741,7 @@ class FusedFluxAttnProcessor2_0_NPU:
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1] :],
+                hidden_states[:, encoder_hidden_states.shape[1]:],
             )
 
             # linear proj
@@ -2679,7 +2759,7 @@ class FluxIPAdapterJointAttnProcessor2_0(torch.nn.Module):
     """Flux Attention processor for IP-Adapter."""
 
     def __init__(
-        self, hidden_size: int, cross_attention_dim: int, num_tokens=(4,), scale=1.0, device=None, dtype=None
+            self, hidden_size: int, cross_attention_dim: int, num_tokens=(4,), scale=1.0, device=None, dtype=None
     ):
         super().__init__()
 
@@ -2714,14 +2794,14 @@ class FluxIPAdapterJointAttnProcessor2_0(torch.nn.Module):
         )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
-        ip_hidden_states: Optional[List[torch.Tensor]] = None,
-        ip_adapter_masks: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
+            ip_hidden_states: Optional[List[torch.Tensor]] = None,
+            ip_adapter_masks: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -2782,7 +2862,7 @@ class FluxIPAdapterJointAttnProcessor2_0(torch.nn.Module):
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1] :],
+                hidden_states[:, encoder_hidden_states.shape[1]:],
             )
 
             # linear proj
@@ -2796,7 +2876,7 @@ class FluxIPAdapterJointAttnProcessor2_0(torch.nn.Module):
             ip_attn_output = torch.zeros_like(hidden_states)
 
             for current_ip_hidden_states, scale, to_k_ip, to_v_ip in zip(
-                ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip
+                    ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip
             ):
                 ip_key = to_k_ip(current_ip_hidden_states)
                 ip_value = to_v_ip(current_ip_hidden_states)
@@ -2830,12 +2910,12 @@ class CogVideoXAttnProcessor2_0:
             raise ImportError("CogVideoXAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         text_seq_length = encoder_hidden_states.size(1)
 
@@ -2899,12 +2979,12 @@ class FusedCogVideoXAttnProcessor2_0:
             raise ImportError("CogVideoXAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         text_seq_length = encoder_hidden_states.size(1)
 
@@ -2975,11 +3055,11 @@ class XFormersAttnAddedKVProcessor:
         self.attention_op = attention_op
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], -1).transpose(1, 2)
@@ -3046,14 +3126,14 @@ class XFormersAttnProcessor:
         self.attention_op = attention_op
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
@@ -3137,14 +3217,14 @@ class AttnProcessorNPU:
             raise ImportError("AttnProcessorNPU requires torch_npu extensions and is supported only on npu devices.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
@@ -3248,14 +3328,14 @@ class AttnProcessor2_0:
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
@@ -3349,14 +3429,14 @@ class XLAFlashAttnProcessor2_0:
         self.partition_spec = partition_spec
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
         if attn.spatial_norm is not None:
@@ -3465,12 +3545,12 @@ class XLAFluxFlashAttnProcessor2_0:
         self.partition_spec = partition_spec
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -3533,7 +3613,7 @@ class XLAFluxFlashAttnProcessor2_0:
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1] :],
+                hidden_states[:, encoder_hidden_states.shape[1]:],
             )
 
             # linear proj
@@ -3558,11 +3638,11 @@ class MochiVaeAttnProcessor2_0:
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         is_single_frame = hidden_states.shape[1] == 1
@@ -3646,9 +3726,9 @@ class StableAudioAttnProcessor2_0:
             )
 
     def apply_partial_rotary_emb(
-        self,
-        x: torch.Tensor,
-        freqs_cis: Tuple[torch.Tensor],
+            self,
+            x: torch.Tensor,
+            freqs_cis: Tuple[torch.Tensor],
     ) -> torch.Tensor:
         from .embeddings import apply_rotary_emb
 
@@ -3661,12 +3741,12 @@ class StableAudioAttnProcessor2_0:
         return out
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from .embeddings import apply_rotary_emb
 
@@ -3777,13 +3857,13 @@ class HunyuanAttnProcessor2_0:
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from .embeddings import apply_rotary_emb
 
@@ -3878,13 +3958,13 @@ class FusedHunyuanAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from .embeddings import apply_rotary_emb
 
@@ -3981,13 +4061,13 @@ class PAGHunyuanAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from .embeddings import apply_rotary_emb
 
@@ -4104,13 +4184,13 @@ class PAGCFGHunyuanAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from .embeddings import apply_rotary_emb
 
@@ -4225,14 +4305,14 @@ class LuminaAttnProcessor2_0:
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        query_rotary_emb: Optional[torch.Tensor] = None,
-        key_rotary_emb: Optional[torch.Tensor] = None,
-        base_sequence_length: Optional[int] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            query_rotary_emb: Optional[torch.Tensor] = None,
+            key_rotary_emb: Optional[torch.Tensor] = None,
+            base_sequence_length: Optional[int] = None,
     ) -> torch.Tensor:
         from .embeddings import apply_rotary_emb
 
@@ -4330,14 +4410,14 @@ class FusedAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ) -> torch.Tensor:
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
@@ -4440,14 +4520,14 @@ class CustomDiffusionXFormersAttnProcessor(nn.Module):
     """
 
     def __init__(
-        self,
-        train_kv: bool = True,
-        train_q_out: bool = False,
-        hidden_size: Optional[int] = None,
-        cross_attention_dim: Optional[int] = None,
-        out_bias: bool = True,
-        dropout: float = 0.0,
-        attention_op: Optional[Callable] = None,
+            self,
+            train_kv: bool = True,
+            train_q_out: bool = False,
+            hidden_size: Optional[int] = None,
+            cross_attention_dim: Optional[int] = None,
+            out_bias: bool = True,
+            dropout: float = 0.0,
+            attention_op: Optional[Callable] = None,
     ):
         super().__init__()
         self.train_kv = train_kv
@@ -4468,11 +4548,11 @@ class CustomDiffusionXFormersAttnProcessor(nn.Module):
             self.to_out_custom_diffusion.append(nn.Dropout(dropout))
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
@@ -4553,13 +4633,13 @@ class CustomDiffusionAttnProcessor2_0(nn.Module):
     """
 
     def __init__(
-        self,
-        train_kv: bool = True,
-        train_q_out: bool = True,
-        hidden_size: Optional[int] = None,
-        cross_attention_dim: Optional[int] = None,
-        out_bias: bool = True,
-        dropout: float = 0.0,
+            self,
+            train_kv: bool = True,
+            train_q_out: bool = True,
+            hidden_size: Optional[int] = None,
+            cross_attention_dim: Optional[int] = None,
+            out_bias: bool = True,
+            dropout: float = 0.0,
     ):
         super().__init__()
         self.train_kv = train_kv
@@ -4579,11 +4659,11 @@ class CustomDiffusionAttnProcessor2_0(nn.Module):
             self.to_out_custom_diffusion.append(nn.Dropout(dropout))
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
@@ -4660,11 +4740,11 @@ class SlicedAttnProcessor:
         self.slice_size = slice_size
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -4747,12 +4827,12 @@ class SlicedAttnAddedKVProcessor:
         self.slice_size = slice_size
 
     def __call__(
-        self,
-        attn: "Attention",
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
+            self,
+            attn: "Attention",
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -4837,9 +4917,9 @@ class SpatialNorm(nn.Module):
     """
 
     def __init__(
-        self,
-        f_channels: int,
-        zq_channels: int,
+            self,
+            f_channels: int,
+            zq_channels: int,
     ):
         super().__init__()
         self.norm_layer = nn.GroupNorm(num_channels=f_channels, num_groups=32, eps=1e-6, affine=True)
@@ -4893,14 +4973,14 @@ class IPAdapterAttnProcessor(nn.Module):
         )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        scale: float = 1.0,
-        ip_adapter_masks: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            scale: float = 1.0,
+            ip_adapter_masks: Optional[torch.Tensor] = None,
     ):
         residual = hidden_states
 
@@ -4990,7 +5070,7 @@ class IPAdapterAttnProcessor(nn.Module):
 
         # for ip-adapter
         for current_ip_hidden_states, scale, to_k_ip, to_v_ip, mask in zip(
-            ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip, ip_adapter_masks
+                ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip, ip_adapter_masks
         ):
             skip = False
             if isinstance(scale, list):
@@ -5098,14 +5178,14 @@ class IPAdapterAttnProcessor2_0(torch.nn.Module):
         )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        scale: float = 1.0,
-        ip_adapter_masks: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            scale: float = 1.0,
+            ip_adapter_masks: Optional[torch.Tensor] = None,
     ):
         residual = hidden_states
 
@@ -5209,7 +5289,7 @@ class IPAdapterAttnProcessor2_0(torch.nn.Module):
 
         # for ip-adapter
         for current_ip_hidden_states, scale, to_k_ip, to_v_ip, mask in zip(
-            ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip, ip_adapter_masks
+                ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip, ip_adapter_masks
         ):
             skip = False
             if isinstance(scale, list):
@@ -5307,12 +5387,12 @@ class IPAdapterXFormersAttnProcessor(torch.nn.Module):
     """
 
     def __init__(
-        self,
-        hidden_size,
-        cross_attention_dim=None,
-        num_tokens=(4,),
-        scale=1.0,
-        attention_op: Optional[Callable] = None,
+            self,
+            hidden_size,
+            cross_attention_dim=None,
+            num_tokens=(4,),
+            scale=1.0,
+            attention_op: Optional[Callable] = None,
     ):
         super().__init__()
 
@@ -5338,14 +5418,14 @@ class IPAdapterXFormersAttnProcessor(torch.nn.Module):
         )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        temb: Optional[torch.FloatTensor] = None,
-        scale: float = 1.0,
-        ip_adapter_masks: Optional[torch.FloatTensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            temb: Optional[torch.FloatTensor] = None,
+            scale: float = 1.0,
+            ip_adapter_masks: Optional[torch.FloatTensor] = None,
     ):
         residual = hidden_states
 
@@ -5425,7 +5505,7 @@ class IPAdapterXFormersAttnProcessor(torch.nn.Module):
                     )
                 else:
                     for index, (mask, scale, ip_state) in enumerate(
-                        zip(ip_adapter_masks, self.scale, ip_hidden_states)
+                            zip(ip_adapter_masks, self.scale, ip_hidden_states)
                     ):
                         if mask is None:
                             continue
@@ -5450,7 +5530,7 @@ class IPAdapterXFormersAttnProcessor(torch.nn.Module):
 
             # for ip-adapter
             for current_ip_hidden_states, scale, to_k_ip, to_v_ip, mask in zip(
-                ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip, ip_adapter_masks
+                    ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip, ip_adapter_masks
             ):
                 skip = False
                 if isinstance(scale, list):
@@ -5537,12 +5617,12 @@ class SD3IPAdapterJointAttnProcessor2_0(torch.nn.Module):
     """
 
     def __init__(
-        self,
-        hidden_size: int,
-        ip_hidden_states_dim: int,
-        head_dim: int,
-        timesteps_emb_dim: int = 1280,
-        scale: float = 0.5,
+            self,
+            hidden_size: int,
+            ip_hidden_states_dim: int,
+            head_dim: int,
+            timesteps_emb_dim: int = 1280,
+            scale: float = 0.5,
     ):
         super().__init__()
 
@@ -5558,13 +5638,13 @@ class SD3IPAdapterJointAttnProcessor2_0(torch.nn.Module):
         self.scale = scale
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        ip_hidden_states: torch.FloatTensor = None,
-        temb: torch.FloatTensor = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: torch.FloatTensor = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            ip_hidden_states: torch.FloatTensor = None,
+            temb: torch.FloatTensor = None,
     ) -> torch.FloatTensor:
         """
         Perform the attention computation, integrating image features (if provided) and timestep embeddings.
@@ -5645,7 +5725,7 @@ class SD3IPAdapterJointAttnProcessor2_0(torch.nn.Module):
             # Split the attention outputs.
             hidden_states, encoder_hidden_states = (
                 hidden_states[:, : residual.shape[1]],
-                hidden_states[:, residual.shape[1] :],
+                hidden_states[:, residual.shape[1]:],
             )
             if not attn.context_pre_only:
                 encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
@@ -5702,12 +5782,12 @@ class PAGIdentitySelfAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        temb: Optional[torch.FloatTensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            temb: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         if attn.spatial_norm is not None:
@@ -5801,12 +5881,12 @@ class PAGCFGIdentitySelfAttnProcessor2_0:
             )
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        temb: Optional[torch.FloatTensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            temb: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         if attn.spatial_norm is not None:
@@ -6008,12 +6088,17 @@ class SanaLinearAttnProcessor2_0:
     """
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            rope=False
     ) -> torch.Tensor:
+        if rope:
+            self.rope = RoPE3D()
+            self.position_getter = PositionGetter3D()
+
         original_dtype = hidden_states.dtype
 
         if encoder_hidden_states is None:
@@ -6026,6 +6111,13 @@ class SanaLinearAttnProcessor2_0:
         query = query.transpose(1, 2).unflatten(1, (attn.heads, -1))
         key = key.transpose(1, 2).unflatten(1, (attn.heads, -1)).transpose(2, 3)
         value = value.transpose(1, 2).unflatten(1, (attn.heads, -1))
+
+        if rope:
+            query = query.transpose(-1, -2)
+            pos_thw = self.position_getter(hidden_states.shape[0], t=3, h=16, w=16, device=query.device)
+            query = self.rope(query, pos_thw)
+            key = self.rope(key, pos_thw)
+            query = query.transpose(-1, -2)
 
         query = F.relu(query)
         key = F.relu(key)
@@ -6101,11 +6193,11 @@ class PAGCFGSanaLinearAttnProcessor2_0:
     """
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         original_dtype = hidden_states.dtype
 
@@ -6156,11 +6248,11 @@ class PAGIdentitySanaLinearAttnProcessor2_0:
     """
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+            self,
+            attn: Attention,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         original_dtype = hidden_states.dtype
 

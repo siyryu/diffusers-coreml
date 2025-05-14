@@ -46,6 +46,8 @@ from ...utils import (
 from ...utils.torch_utils import randn_tensor
 from ...video_processor import VideoProcessor
 
+# from torchvision imoprt transformers
+
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -779,6 +781,7 @@ class LTXSana3dPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
     def __call__(
             self,
             prompt: Union[str, List[str]] = None,
+            first_frame_latent: torch.Tensor = None,
             negative_prompt: str = "",
             num_inference_steps: int = 20,
             timesteps: List[int] = None,
@@ -1002,6 +1005,15 @@ class LTXSana3dPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             latents,
         )
 
+        latents[:, :, :1, :, :] = first_frame_latent
+        bs, _, frames, H, W = latents.shape
+        cond_mask = torch.zeros(
+            (bs, frames * H * W),
+            dtype=torch.float32,
+            device=latents.device,
+        )
+        cond_mask[:, :1 * H * W] = 1.0
+
         # latents = torch.load("/data/baotang/sana_videodistill/video_distill/0331/init_z.pt")
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -1030,6 +1042,7 @@ class LTXSana3dPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
                     encoder_hidden_states=prompt_embeds,
                     encoder_attention_mask=prompt_attention_mask,
                     timestep=timestep,
+                    cond_mask=cond_mask,
                     return_dict=False,
                     attention_kwargs=self.attention_kwargs,
                 )[0]
@@ -1048,6 +1061,9 @@ class LTXSana3dPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
 
                 # compute previous image: x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+                if first_frame_latent is not None:
+                    latents[:, :, :1, :, :] = first_frame_latent
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
