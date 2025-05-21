@@ -45,6 +45,23 @@ else:
     XLA_AVAILABLE = False
 
 
+def cartesian_prod(*tensors: torch.Tensor) -> torch.Tensor:
+    """
+    用 torch.meshgrid 生成坐标网格，再堆叠成 (∏Ni , len(tensors)) 形状
+    等价于 torch.cartesian_prod(*tensors)
+    """
+    if len(tensors) == 0:
+        raise ValueError("至少需要一个 tensor")
+    if any(t.dim() != 1 for t in tensors):
+        raise ValueError("所有输入必须是一维张量")
+
+    # meshgrid 产生 len(tensors) 个 N 维网格
+    grids = torch.meshgrid(*tensors,
+                           indexing='ij')  # PyTorch 1.10+ 支持 indexing 参数   [oai_citation:0‡PyTorch](https://pytorch.org/docs/stable/generated/torch.meshgrid.html?utm_source=chatgpt.com)
+    # 将每个网格展平成一维，再在最后一维拼成列
+    out = torch.stack([g.reshape(-1) for g in grids], dim=-1)
+    return out
+
 class PositionGetter3D(object):
     """ return positions of patches """
 
@@ -56,7 +73,8 @@ class PositionGetter3D(object):
             x = torch.arange(w, device=device)
             y = torch.arange(h, device=device)
             z = torch.arange(t, device=device)
-            pos = torch.cartesian_prod(z, y, x)
+            # pos = torch.cartesian_prod(z, y, x)
+            pos = cartesian_prod(z, y, x)
 
             pos = pos.reshape(t * h * w, 3).transpose(0, 1).reshape(3, 1, -1).contiguous().expand(3, b, -1).clone()
             poses = (pos[0].contiguous(), pos[1].contiguous(), pos[2].contiguous())
