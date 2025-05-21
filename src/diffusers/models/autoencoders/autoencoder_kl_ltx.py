@@ -69,12 +69,20 @@ class LTXVideoCausalConv3d(nn.Module):
         time_kernel_size = self.kernel_size[0]
 
         if self.is_causal:
-            pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, time_kernel_size - 1, 1, 1))
-            hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
+            if time_kernel_size > 1:
+                pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, time_kernel_size - 1, 1, 1))
+                hidden_states = torch.cat([pad_left, hidden_states], dim=2)
         else:
-            pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, (time_kernel_size - 1) // 2, 1, 1))
-            pad_right = hidden_states[:, :, -1:, :, :].repeat((1, 1, (time_kernel_size - 1) // 2, 1, 1))
-            hidden_states = torch.concatenate([pad_left, hidden_states, pad_right], dim=2)
+            if time_kernel_size > 1:
+                pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, (time_kernel_size - 1) // 2, 1, 1))
+                pad_right = hidden_states[:, :, -1:, :, :].repeat((1, 1, (time_kernel_size - 1) // 2, 1, 1))
+                hidden_states = torch.cat([pad_left, hidden_states, pad_right], dim=2)
+
+        # if time_kernel_size > 1:
+        #     pad_count = (time_kernel_size - 1) // 2
+        #     pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, pad_count, 1, 1))
+        #     pad_right = hidden_states[:, :, -1:, :, :].repeat((1, 1, pad_count, 1, 1))
+        #     hidden_states = torch.cat([pad_left, hidden_states, pad_right], dim=2)
 
         hidden_states = self.conv(hidden_states)
         return hidden_states
