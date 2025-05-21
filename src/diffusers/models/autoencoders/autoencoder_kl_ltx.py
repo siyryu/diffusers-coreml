@@ -126,7 +126,6 @@ class LTXVideoCausalDepthwiseSeperableConv3d(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         time_kernel_size = self.kernel_size[0]
-        print(f"{time_kernel_size=}")
         if time_kernel_size > 1:
             pad_count = (time_kernel_size - 1) // 2
             pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, pad_count, 1, 1))
@@ -270,7 +269,6 @@ class LTXVideoResnetBlock3d(nn.Module):
         if self.conv_shortcut is not None:
             inputs = self.conv_shortcut(inputs)
 
-        print(f"269:{hidden_states.shape=}, {inputs.shape=}")
         hidden_states = hidden_states + inputs
         return hidden_states
 
@@ -664,8 +662,6 @@ class LTXVideoMidBlock3d(nn.Module):
             generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         r"""Forward method of the `LTXMidBlock3D` class."""
-
-        print(f"665:{hidden_states.shape=}")
 
         if self.time_embedder is not None:
             temb = self.time_embedder(
@@ -1093,7 +1089,6 @@ class LTXVideoDecoder3d(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
         hidden_states = self.conv_in(hidden_states)
-        print(f"{hidden_states.shape=}")
 
         if self.timestep_scale_multiplier is not None:
             temb = temb * self.timestep_scale_multiplier
