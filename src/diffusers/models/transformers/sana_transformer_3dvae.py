@@ -277,6 +277,7 @@ class LTXSanaTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             norm_elementwise_affine: bool = False,
             norm_eps: float = 1e-6,
             interpolation_scale: Optional[int] = None,
+            flow=False,
     ) -> None:
         super().__init__()
 
@@ -297,6 +298,7 @@ class LTXSanaTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # self.input_size = (17, sample_size, sample_size)
         # self.hidden_size = inner_dim
         self.patch_size = patch_size
+        self.flow = flow
 
         # num_patches = 17 * sample_size * sample_size
         # self.register_buffer("pos_embed", torch.zeros(1, num_patches, inner_dim))
@@ -304,6 +306,7 @@ class LTXSanaTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         # 2. Additional condition embeddings
         self.time_embed = AdaLayerNormSingle(inner_dim)
+        self.flow_embed = AdaLayerNormSingle(inner_dim)
 
         self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
         self.caption_norm = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
@@ -462,6 +465,7 @@ class LTXSanaTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             encoder_hidden_states: torch.Tensor,
             timestep: torch.LongTensor,
             cond_mask: torch.Tensor,
+            flow_score=None,
             encoder_attention_mask: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -528,6 +532,14 @@ class LTXSanaTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         timestep, embedded_timestep = self.time_embed(
             timestep, batch_size=batch_size, hidden_dtype=hidden_states.dtype
         )
+
+        if flow_score is not None and self.flow:
+            L = T * H * W
+            flow_score = flow_score.unsqueeze(1).repeat(1, L)
+            flow_score, _ = self.flow_embed(
+                flow_score, batch_size=batch_size, hidden_dtype=hidden_states.dtype
+            )
+            timestep = timestep + flow_score
 
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])

@@ -817,6 +817,7 @@ class LTXSana3dPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             #     "User Prompt: ",
             # ],
             complex_human_instruction: Optional[List[str]] = None,
+            flow_score=None,
     ) -> Union[SanaPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -1045,6 +1046,7 @@ class LTXSana3dPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
                     cond_mask=cond_mask,
                     return_dict=False,
                     attention_kwargs=self.attention_kwargs,
+                    flow_score=flow_score,
                 )[0]
                 noise_pred = noise_pred.float()
 
